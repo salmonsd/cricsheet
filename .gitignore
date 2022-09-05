@@ -1,0 +1,8 @@
+.DS_Store
+
+.devcontainer/
+.vscode/
+answers/
+db/
+
+__pycache__/
