@@ -1,25 +1,38 @@
-import urllib.request
-import zipfile
+import sys
 import json
-from utils.config import ZIP_URL
-from utils.db_utils import get_db_connection
+import zipfile
+import logging
+import urllib.request
+
 from typing import Dict
 from datetime import date
+from tqdm import tqdm
+
+from utils.config import ZIP_URL
+from utils.db_utils import get_db_connection
+from utils.logger_utils import get_logger
+
+
+# setup logging
+py_file = __file__.split("/")[-1]
+logger = get_logger(name=f"{py_file}:{__name__}")
 
 
 def run():
 
-    db_con = get_db_connection()
+    logger.info("Getting database connection")
+    conn = get_db_connection()
 
+    logger.info(f"Getting ZIP from: {ZIP_URL}")
     zip_object = get_zip(ZIP_URL)
 
     json_file_list = [file for file in zip_object.namelist() if ".json" in file]
 
-    for file in json_file_list:
-        file_name = str(file)
-        file_number = int(file.split(".")[0])
+    logger.info(f"Found {len(json_file_list)} files, processing now...")
+    for file in tqdm(json_file_list):
         # get file data
         file_json = get_json_elements(file, zip_object)
+        file_number = int(file.split(".")[0])
 
         # separate three main dicts
         file_meta = file_json.get("meta")
@@ -31,9 +44,9 @@ def run():
             map(file_meta.get, ["data_version", "created", "revision"])
         )
 
-        # parse player registry and combine with file_info players
+        # players table - combine players and player_registry objects
         player_registry = file_info.get("registry").get("people")
-        player_data = [
+        players_data = [
             (id, name, team, file_info.get("gender"))
             for name, id in player_registry.items()
             for team, name_list in file_info.get("players").items()
@@ -41,13 +54,14 @@ def run():
             if _ == name
         ]
 
+        # match_outcome table
         outcome_type = None
         outcome_margin = None
         outcome_dict = file_info.get("outcome").get("by", None)
         if outcome_dict is not None:
             outcome_type = list(outcome_dict.keys())[0]
             outcome_margin = list(outcome_dict.values())[0]
-        # match_outcome table
+
         match_outcome_data = (
             file_info.get("match_type"),
             file_info.get("match_type_number"),
@@ -61,8 +75,8 @@ def run():
             outcome_margin,
         )
 
-        # parse match info
-        match_info_data = [
+        # innings tables
+        innings_data = [
             (
                 side_dict.get("team"),
                 overs_dict.get("over"),
@@ -79,68 +93,78 @@ def run():
             for delivery, delivery_dict in enumerate(overs_dict.get("deliveries"))
         ]
 
-        with db_con:
-            db_con.executemany(
-                """
-                INSERT INTO players(id, name, team, gender) 
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(id) DO NOTHING
-                """,
-                player_data,
-            )
+        # *** DB INSERT ***
+        try:
+            with conn:
+                conn.executemany(
+                    """
+                    INSERT INTO players(id, name, team, gender) 
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(id) DO NOTHING
+                    """,
+                    players_data,
+                )
 
-            db_con.execute(
-                f"""
-                INSERT INTO match_outcome(
-                    file_number,
-                    match_type,
-                    match_type_number,
-                    season,
-                    match_date,
-                    gender,
-                    team_1,
-                    team_2,
-                    winner,
-                    outcome_type,
-                    outcome_by
-                    )
-                VALUES ({file_number}, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(file_number) DO NOTHING
-                """,
-                match_outcome_data,
-            )
+                conn.execute(
+                    f"""
+                    INSERT INTO match_outcome(
+                        file_number,
+                        match_type,
+                        match_type_number,
+                        season,
+                        match_date,
+                        gender,
+                        team_1,
+                        team_2,
+                        winner,
+                        outcome_type,
+                        outcome_by
+                        )
+                    VALUES ({file_number}, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(file_number) DO NOTHING
+                    """,
+                    match_outcome_data,
+                )
 
-            db_con.executemany(
-                f"""
-                INSERT INTO innings(
-                    file_number,
-                    team,
-                    over,
-                    delivery,
-                    batter,
-                    bowler,
-                    non_striker,
-                    batter_runs,
-                    extras_runs,
-                    total_runs
-                    )
-                VALUES ({file_number}, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                match_info_data,
-            )
+                conn.executemany(
+                    f"""
+                    INSERT INTO innings(
+                        file_number,
+                        team,
+                        over,
+                        delivery,
+                        batter,
+                        bowler,
+                        non_striker,
+                        batter_runs,
+                        extras_runs,
+                        total_runs
+                        )
+                    VALUES ({file_number}, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    innings_data,
+                )
 
-            db_con.execute(
-                f"""
-                INSERT INTO file_processed(
-                    file_number,
-                    data_version,
-                    created,
-                    revision
-                    )
-                VALUES ({file_number}, ?, ?, ?)
-                """,
-                file_processed_data,
-            )
+                conn.execute(
+                    f"""
+                    INSERT INTO file_processed(
+                        file_number,
+                        data_version,
+                        created,
+                        revision
+                        )
+                    VALUES ({file_number}, ?, ?, ?)
+                    """,
+                    file_processed_data,
+                )
+
+        except Exception as e:
+            logger.error(e)
+            conn.close()
+            sys.exit(1)
+
+    logger.info("Finished processing files, closing DB connection")
+    conn.close()
 
 
 def get_zip(url: str):
