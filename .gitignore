@@ -2,7 +2,7 @@
 
 .devcontainer/
 .vscode/
-answers/
+*.pdf
 db/
 
 __pycache__/
